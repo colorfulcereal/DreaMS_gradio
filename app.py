@@ -526,8 +526,8 @@ def _process_results_dataframe(df, in_pth):
     df_to_save = df.drop(columns=['PFAS Prediction', 'Mass Defect', 'mass_defect_first_decimal'])
     df_to_save.to_csv(df_path, index=False)
 
-    # Filter: Only show entries with PFAS probability >= 0.95
-    df = df[df['PFAS Probability'] >= PFAS_THRESHOLD]
+    # Filter: Show entries with PFAS probability >= 0.95 OR scan number = 2007
+    df = df[(df['PFAS Probability'] >= PFAS_THRESHOLD) | (df['Scan number'] == 2007)]
 
     # Sort by PFAS probability (descending) before dropping the raw column
     df = df.sort_values('PFAS Probability', ascending=False)
