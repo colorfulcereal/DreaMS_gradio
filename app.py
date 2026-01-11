@@ -39,6 +39,17 @@ from tqdm import tqdm
 from dreams.utils.io import append_to_stem
 from dreams.utils.dformats import DataFormatA
 
+# ============================================================================
+# DETERMINISTIC BEHAVIOR FOR REPRODUCIBILITY
+# ============================================================================
+# Ensure consistent predictions across CPU and GPU
+torch.manual_seed(42)
+np.random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+if hasattr(torch, 'use_deterministic_algorithms'):
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
 # =============================================================================
 # CONSTANTS AND CONFIGURATION
 # =============================================================================
@@ -526,8 +537,8 @@ def _process_results_dataframe(df, in_pth):
     df_to_save = df.drop(columns=['PFAS Prediction', 'Mass Defect', 'mass_defect_first_decimal'])
     df_to_save.to_csv(df_path, index=False)
 
-    # Filter: Show entries with PFAS probability >= 0.95 OR scan number = 2007
-    df = df[(df['PFAS Probability'] >= PFAS_THRESHOLD) | (df['Scan number'] == 2007)]
+    # Filter: Show entries with PFAS probability >= 0.95
+    df = df[(df['PFAS Probability'] >= PFAS_THRESHOLD)]
 
     # Sort by PFAS probability (descending) before dropping the raw column
     df = df.sort_values('PFAS Probability', ascending=False)
@@ -732,7 +743,7 @@ if __name__ == "__main__":
     
     # Create and launch the Gradio interface
     app = _create_gradio_interface()
-    app.launch(allowed_paths=['./assets'])
+    app.launch(allowed_paths=['./assets'], share=True)
 else:
     # When imported as a module, just run setup
     setup()
