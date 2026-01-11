@@ -1,8 +1,8 @@
 """
 DreaMS Gradio Web Application
 
-This module provides a web interface for the DreaMS (Deep Representations Empowering 
-the Annotation of Mass Spectra) tool using Gradio. It allows users to upload MS/MS 
+This module provides a web interface for the DreaMS (Deep Representations Empowering
+the Annotation of Mass Spectra) tool using Gradio. It allows users to upload MS/MS
 files and perform library matching with DreaMS embeddings.
 
 Author: DreaMS Team
@@ -12,6 +12,7 @@ License: MIT
 import gradio as gr
 import spaces
 import shutil
+import torch
 import urllib.request
 from datetime import datetime
 from functools import partial
@@ -30,8 +31,13 @@ import io
 import dreams.utils.spectra as su
 import dreams.utils.io as dio
 from dreams.utils.data import MSData
-from dreams.api import dreams_embeddings
+from dreams.api import dreams_embeddings, dreams_predictions
 from dreams.definitions import *
+from massspecgym.models.pfas import HalogenDetectorDreamsTest
+from pathlib import Path
+from tqdm import tqdm
+from dreams.utils.io import append_to_stem
+from dreams.utils.dformats import DataFormatA
 
 # =============================================================================
 # CONSTANTS AND CONFIGURATION
@@ -45,6 +51,25 @@ SPECTRUM_IMG_SIZE = 800  # Reduced from 1500 for faster generation
 LIBRARY_PATH = Path('DreaMS/data/MassSpecGym_DreaMS.hdf5')
 DATA_PATH = Path('./DreaMS/data')
 EXAMPLE_PATH = Path('./data')
+
+# PFAS model configuration
+PFAS_MODEL_PATH = Path('/Users/ramsindhu/Downloads/HalogenDetection-FocalLoss-MergedMassSpecNIST20_NISTNew_NormalPFAS_ujmvyfxm_checkpoints_epoch=0-step=9285.ckpt')
+PFAS_THRESHOLD = 0.95
+N_HIGHEST_PEAKS = 60
+
+# Load model with weights_only=False for PyTorch 2.6+ compatibility
+# Safe because this is a trusted checkpoint
+try:
+    # Try with safe_globals context manager (PyTorch 2.6+)
+    with torch.serialization.safe_globals([getattr]):
+        MODEL = HalogenDetectorDreamsTest.load_from_checkpoint(PFAS_MODEL_PATH)
+except Exception as e:
+    # Fallback: patch torch.load temporarily
+    import functools
+    original_load = torch.load
+    torch.load = functools.partial(original_load, weights_only=False)
+    MODEL = HalogenDetectorDreamsTest.load_from_checkpoint(PFAS_MODEL_PATH)
+    torch.load = original_load
 
 # Cache for SMILES images to avoid regeneration
 _smiles_cache = {}
@@ -178,39 +203,90 @@ def spectrum_to_html_img(spec1, spec2, img_size=SPECTRUM_IMG_SIZE):
     """
     Convert spectrum plot to HTML image for display in Gradio dataframe
     Optimized version based on working code
-    
+
     Args:
         spec1: First spectrum data
         spec2: Second spectrum data (for mirror plot)
         img_size: Size of the output image (default: SPECTRUM_IMG_SIZE)
-    
+
     Returns:
         str: HTML img tag with base64 encoded spectrum plot
     """
     try:
         # Use non-interactive matplotlib backend
         matplotlib.use('Agg')
-        
+
         # Create the spectrum plot using DreaMS utility function
         su.plot_spectrum(spec=spec1, mirror_spec=spec2, figsize=(1.6, 0.8))  # Reduced size for performance
-        
+
         # Save figure to buffer with transparent background
         buffered = BytesIO()
         plt.savefig(buffered, format='png', bbox_inches='tight', dpi=80, transparent=True)
         buffered.seek(0)
-        
+
         # Convert to PIL Image, crop edges, and convert to base64
         img = Image.open(buffered)
         img = _crop_transparent_edges(img)
         img_str = _convert_pil_to_base64(img)
-        
+
         # Clean up matplotlib figure to free memory
         plt.close()
-        
+
         return f"<img src='{img_str}' style='max-width: 100%; height: auto;' title='Spectrum comparison' />"
-        
+
     except Exception as e:
         return f"<div style='text-align: center; color: red;'>Error: {str(e)}</div>"
+
+
+def pfas_to_html(pfas_prob, threshold=PFAS_THRESHOLD):
+    """
+    Convert PFAS probability to HTML with visual styling
+
+    Args:
+        pfas_prob: PFAS probability value (0-1)
+        threshold: Threshold for highlighting (default: PFAS_THRESHOLD)
+
+    Returns:
+        str: HTML formatted PFAS prediction with styling
+    """
+    try:
+        prob_pct = pfas_prob * 100
+
+        if pfas_prob >= threshold:
+            # Bold text with PFAS badge for values above threshold
+            return f"<span style='font-weight: bold; font-size: 14px;'>{prob_pct:.1f}%</span><br/><span style='background-color: #ff6b6b; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold;'>PFAS</span>"
+        else:
+            # Regular text for values below threshold
+            return f"{prob_pct:.1f}%"
+
+    except Exception as e:
+        return f">Error: {str(e)}"
+
+
+def check_mass_defect(precursor_mz):
+    """
+    Check if first decimal of precursor m/z matches PFAS pattern (0.6, 0.7, 0.8, or 0.9)
+
+    Args:
+        precursor_mz: Precursor m/z value
+
+    Returns:
+        str: HTML formatted mass defect check result
+    """
+    try:
+        # Get the first decimal digit
+        # e.g., 413.9787 -> 9, 312.6543 -> 6
+        first_decimal = int(str(precursor_mz).split('.')[1][0]) if '.' in str(precursor_mz) else 0
+
+        if first_decimal in [6, 7, 8, 9]:
+            # PFAS-like mass defect pattern
+            return f"<span style='background-color: #4CAF50; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold;'>✓ .{first_decimal}</span>"
+        else:
+            # Not a typical PFAS pattern
+            return f"<span style='color: #999;'>.{first_decimal}</span>"
+
+    except Exception as e:
+        return f"<span style='color: red;'>Error</span>"
 
 
 # =============================================================================
@@ -236,46 +312,31 @@ def _download_file(url, target_path, description):
 def setup():
     """
     Initialize the application by downloading required data files
-    
+
     Downloads:
-    - MassSpecGym spectral library
     - Example MS/MS files for testing
-    
+
     Raises:
         Exception: If critical setup steps fail
     """
     print("=" * 60)
-    print("Setting up DreaMS application...")
+    print("Setting up DreaMS-PFAS screening application...")
     print("=" * 60)
     
-    # Clear any existing cache
-    clear_smiles_cache()
-    
     try:
-        # Download spectral library
-        library_url = 'https://huggingface.co/datasets/roman-bushuiev/GeMS/resolve/main/data/auxiliary/MassSpecGym_DreaMS.hdf5'
-        _download_file(library_url, LIBRARY_PATH, "MassSpecGym spectral library")
-        
         # Download example files
         example_urls = [
-            ('https://huggingface.co/datasets/titodamiani/PiperNET/resolve/main/lcms/rawfiles/202312_147_P55-Leaf-r2_1uL.mzML',
-             EXAMPLE_PATH / '202312_147_P55-Leaf-r2_1uL.mzML',
-             "PiperNET example spectra"),
             ('https://raw.githubusercontent.com/pluskal-lab/DreaMS/refs/heads/main/data/examples/example_5_spectra.mgf',
              EXAMPLE_PATH / 'example_5_spectra.mgf',
              "DreaMS example spectra")
         ]
-        
+
         for url, path, desc in example_urls:
             _download_file(url, path, desc)
-        
-        # Test DreaMS embeddings to ensure everything works
-        print("\nTesting DreaMS embeddings...")
-        test_path = EXAMPLE_PATH / 'example_5_spectra.mgf'
-        embs = dreams_embeddings(test_path)
-        print(f"✓ Setup complete - DreaMS embeddings test successful (shape: {embs.shape})")
+
+        print(f"\n✓ Setup complete - PFAS screening tool ready")
         print("=" * 60)
-        
+
     except Exception as e:
         print(f"✗ Setup failed: {e}")
         print("The application may not work properly. Please check your internet connection and try again.")
@@ -290,243 +351,266 @@ def setup():
 def _predict_gpu(in_pth, progress):
     """
     GPU-accelerated prediction of DreaMS embeddings
-    
+
     Args:
         in_pth: Input file path
         progress: Gradio progress tracker
-    
+
     Returns:
         numpy.ndarray: DreaMS embeddings
     """
     progress(0.2, desc="Loading spectra data...")
     msdata = MSData.load(in_pth)
-    
+
     progress(0.3, desc="Computing DreaMS embeddings...")
     embs = dreams_embeddings(msdata)
     print(f'Shape of the query embeddings: {embs.shape}')
-    
+
     return embs
 
 
-def _create_result_row(i, j, n, msdata, msdata_lib, sims, cos_sim, embs, similarity_threshold, calculate_modified_cosine=False):
+@spaces.GPU
+def _predict_pfas_gpu(in_pth, progress):
     """
-    Create a single result row for the DataFrame
-    
+    GPU-accelerated prediction of PFAS probabilities
+
+    Args:
+        in_pth: Input file path
+        progress: Gradio progress tracker
+
+    Returns:
+        numpy.ndarray: PFAS probabilities
+    """
+    progress(0.4, desc="Computing PFAS predictions...")
+    # Use different loading method for mzML files
+    if str(in_pth).lower().endswith('.mzml'):
+        try:
+            pfas_preds = _find_PFAS_mzML(in_pth)
+        except ValueError as e:
+            print(f'Error loading mzML file: {e}')
+            raise
+    else:
+        msdata = MSData.load(in_pth)
+        pfas_preds = dreams_predictions(
+            spectra=msdata,
+            model_ckpt=MODEL,
+            n_highest_peaks=N_HIGHEST_PEAKS
+        )
+
+    pfas_preds = torch.sigmoid(torch.from_numpy(pfas_preds)).cpu().numpy()
+    print(f'Shape of PFAS predictions: {pfas_preds.shape}')
+
+    return pfas_preds
+
+def _find_PFAS_mzML(in_pth):
+    # in_pth = 'data/teo/abc.mzML
+    # in_pth = Path('/teamspace/studios/this_studio/SLI23_040.mzML')
+
+    n_highest_peaks = 60
+
+    print(f'Processing {in_pth}...')
+
+    # Load data
+    try:
+        msdata = MSData.from_mzml(in_pth, verbose_parser=True)
+    except ValueError as e:
+        print(f'Skipping {in_pth} because of {e}.')
+        return
+
+    # Get spectra (m/z and inetsnity arrays) and precursor m/z values from the input dataset
+    spectra = msdata['spectrum']
+    prec_mzs = msdata['precursor_mz']
+
+    # Ref: https://dreams-docs.readthedocs.io/en/latest/tutorials/spectral_quality.html
+    # Subject each spectrum to spectral quality checks
+    dformat = DataFormatA()
+    quality_lvls = [dformat.val_spec(s, p, return_problems=True) for s, p in zip(spectra, prec_mzs)]
+
+    # Check how many spectra passed all filters (`All checks passed`) and how many spectra did not pass some of the filters
+    print(pd.Series(quality_lvls).value_counts())
+
+    # Define path for output high-quality file
+    hq_pth = append_to_stem(in_pth, 'high_quality').with_suffix('.hdf5')
+
+    # Pick only high-quality spectra and save them to `hq_pth`
+    msdata.form_subset(
+        idx=np.where(np.array(quality_lvls) == 'All checks passed')[0],
+        out_pth=hq_pth
+    )
+
+    # Try reading the new file
+    msdata_hq = MSData.load(hq_pth)
+
+    # Compute PFAS logits predictions
+    f_preds = dreams_predictions(
+        spectra=msdata_hq,
+        model_ckpt=MODEL,
+        n_highest_peaks=n_highest_peaks
+    )
+
+    return f_preds
+
+def _create_result_row(i, msdata, pfas_preds):
+    """
+    Create a single result row for the DataFrame (PFAS screening only)
+
     Args:
         i: Query spectrum index
-        j: Library spectrum index
-        n: Top-k rank
         msdata: Query MS data
-        msdata_lib: Library MS data
-        sims: Similarity matrix
-        cos_sim: Cosine similarity calculator
-        embs: Query embeddings
-        similarity_threshold: Similarity threshold for filtering results
-        calculate_modified_cosine: Whether to calculate modified cosine similarity
-    
+        pfas_preds: PFAS predictions
+
     Returns:
         dict: Result row data
     """
-    smiles = msdata_lib.get_smiles(j)
-    spec1 = msdata.get_spectra(i)
-    spec2 = msdata_lib.get_spectra(j)
-    
-    dreams_similarity = sims[i, j]
-    
-    # Base row data
+    pfas_prob = pfas_preds[i]
+    precursor_mz = msdata.get_prec_mzs(i)
+
+    # Create row data
     row_data = {
         'scan_number': msdata.get_values(SCAN_NUMBER, i) if SCAN_NUMBER in msdata.columns() else None,
         'rt': msdata.get_values(RT, i) if RT in msdata.columns() else None,
         'charge': msdata.get_values(CHARGE, i) if CHARGE in msdata.columns() else None,
-        'precursor_mz': msdata.get_prec_mzs(i),
-        'topk': n + 1,
-        'library_j': j,
-        'library_SMILES': smiles_to_html_img(smiles) if dreams_similarity > similarity_threshold else None,
-        'library_SMILES_raw': smiles,
-        'Spectrum': spectrum_to_html_img(spec1, spec2) if dreams_similarity > similarity_threshold else None,
-        'Spectrum_raw': su.unpad_peak_list(spec1),
-        'library_ID': msdata_lib.get_values('IDENTIFIER', j),
-        'DreaMS_similarity': dreams_similarity,
-        'i': i,
-        'j': j,
-        'DreaMS_embedding': embs[i],
+        'precursor_mz': precursor_mz,
+        'precursor_mz_raw': precursor_mz,
+        'PFAS_prediction': pfas_to_html(pfas_prob),
+        'PFAS_probability_raw': pfas_prob,
+        'mass_defect_check': check_mass_defect(precursor_mz),
     }
-    
-    # Add modified cosine similarity only if enabled
-    if calculate_modified_cosine:
-        modified_cosine_sim = cos_sim(
-            spec1=spec1,
-            prec_mz1=msdata.get_prec_mzs(i),
-            spec2=spec2,
-            prec_mz2=msdata_lib.get_prec_mzs(j),
-        )
-        row_data['Modified_cosine_similarity'] = modified_cosine_sim
-    
+
     return row_data
 
 
-def _process_results_dataframe(df, in_pth, similarity_threshold, calculate_modified_cosine=False):
+def _process_results_dataframe(df, in_pth):
     """
-    Process and clean the results DataFrame
-    
+    Process and clean the results DataFrame (PFAS screening only)
+
     Args:
         df: Raw results DataFrame
         in_pth: Input file path for CSV export
-        similarity_threshold: Similarity threshold for filtering results
-        calculate_modified_cosine: Whether modified cosine similarity was calculated
-    
+
     Returns:
         tuple: (processed_df, csv_path)
     """
-    # Remove unnecessary columns and round similarity scores
-    df = df.drop(columns=['i', 'j', 'library_j'])
-    df['DreaMS_similarity'] = df['DreaMS_similarity'].astype(float).round(4)
-    
-    # Handle modified cosine similarity column conditionally
-    if calculate_modified_cosine and 'Modified_cosine_similarity' in df.columns:
-        df['Modified_cosine_similarity'] = df['Modified_cosine_similarity'].astype(float).round(4)
-    
-    df['precursor_mz'] = df['precursor_mz'].astype(float).round(4)
-    df['rt'] = df['rt'].astype(float).round(2)  # Round retention time to 2 decimal places
-    df['charge'] = df['charge'].astype(str)  # Keep charge as string
-    
+    # Round numerical values
+    df['PFAS_probability_raw'] = df['PFAS_probability_raw'].astype(float).round(4)
+    df['precursor_mz_raw'] = df['precursor_mz_raw'].astype(float).round(4)
+
+    # Handle optional columns
+    if 'rt' in df.columns:
+        df['rt'] = df['rt'].astype(float).round(2)
+    if 'charge' in df.columns:
+        df['charge'] = df['charge'].astype(str)
+
+    # Add mass defect first decimal column for filtering
+    df['mass_defect_first_decimal'] = df['precursor_mz_raw'].apply(
+        lambda x: int(str(x).split('.')[1][0]) if '.' in str(x) else 0
+    )
+
     # Rename columns for display
     column_mapping = {
-        'topk': 'Top k',
-        'library_ID': 'Library ID',
         "scan_number": "Scan number",
         "rt": "Retention time",
         "charge": "Charge",
         "precursor_mz": "Precursor m/z",
-        "library_SMILES": "Molecule",
-        "library_SMILES_raw": "SMILES",
-        "Spectrum": "Spectrum",
-        "Spectrum_raw": "Input Spectrum",
-        "DreaMS_similarity": "DreaMS similarity",
-        "DreaMS_embedding": "DreaMS embedding",
+        "precursor_mz_raw": "Precursor m/z (raw)",
+        "PFAS_prediction": "PFAS Prediction",
+        "PFAS_probability_raw": "PFAS Probability",
+        "mass_defect_check": "Mass Defect",
     }
-    
-    # Add modified cosine similarity to column mapping only if it exists
-    if calculate_modified_cosine and 'Modified_cosine_similarity' in df.columns:
-        column_mapping["Modified_cosine_similarity"] = "Modified cos similarity"
-    
+
     df = df.rename(columns=column_mapping)
-    
+
     # Save full results to CSV
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    df_path = dio.append_to_stem(in_pth, f"MassSpecGym_hits_{timestamp}").with_suffix('.csv')
-    df_to_save = df.drop(columns=['Molecule', 'Spectrum', 'Top k'])
+    df_path = dio.append_to_stem(in_pth, f"PFAS_screening_{timestamp}").with_suffix('.csv')
+    df_to_save = df.drop(columns=['PFAS Prediction', 'Mass Defect', 'mass_defect_first_decimal'])
     df_to_save.to_csv(df_path, index=False)
-    
-    # Filter and prepare final display DataFrame
-    df = df.drop(columns=['DreaMS embedding', "SMILES", "Input Spectrum"])
-    df = df[df['Top k'] == 1].sort_values('DreaMS similarity', ascending=False)
-    df = df.drop(columns=['Top k'])
-    df = df[df["DreaMS similarity"] > similarity_threshold]
-    
+
+    # Filter: Only show entries with PFAS probability >= 0.95
+    df = df[df['PFAS Probability'] >= PFAS_THRESHOLD]
+
+    # Sort by PFAS probability (descending) before dropping the raw column
+    df = df.sort_values('PFAS Probability', ascending=False)
+
+    # Prepare final display DataFrame
+    df = df.drop(columns=['PFAS Probability', 'Precursor m/z (raw)', 'mass_defect_first_decimal'])
+
     # Add row numbers
     df.insert(0, 'Row', range(1, len(df) + 1))
-    
+
     return df, str(df_path)
 
 
 def _predict_core(lib_pth, in_pth, similarity_threshold, calculate_modified_cosine, progress):
     """
-    Core prediction function that orchestrates the entire prediction pipeline
-    
+    Core prediction function for PFAS detection (library matching disabled)
+
     Args:
-        lib_pth: Library file path
+        lib_pth: Library file path (not used, kept for compatibility)
         in_pth: Input file path
-        calculate_modified_cosine: Whether to calculate modified cosine similarity
+        similarity_threshold: Not used (kept for compatibility)
+        calculate_modified_cosine: Not used (kept for compatibility)
         progress: Gradio progress tracker
-    
+
     Returns:
         tuple: (results_dataframe, csv_file_path)
     """
     in_pth = Path(in_pth)
-    
-    # Clear cache at start to prevent memory buildup
-    clear_smiles_cache()
 
-    # Create temporary copies of library and input files to allow multiple processes
-    progress(0, desc="Creating temporary file copies...")
-    temp_lib_path = Path(lib_pth).parent / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{Path(lib_pth).name}"
+    # Create temporary copy of input file
+    progress(0, desc="Creating temporary file copy...")
     temp_in_path = in_pth.parent / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{in_pth.name}"
-    shutil.copy2(lib_pth, temp_lib_path)
     shutil.copy2(in_pth, temp_in_path)
 
     try:
-        # Load library data
-        progress(0.1, desc="Loading library data...")
-        msdata_lib = MSData.load(temp_lib_path, in_mem=True)
-        embs_lib = msdata_lib[DREAMS_EMBEDDING]
-        print(f'Shape of the library embeddings: {embs_lib.shape}')
-        
-        # Get query embeddings
-        embs = _predict_gpu(temp_in_path, progress)
-        
-        # Compute similarity matrix
-        progress(0.4, desc="Computing similarity matrix...")
-        sims = cosine_similarity(embs, embs_lib)
-        print(f'Shape of the similarity matrix: {sims.shape}')
-        
-        # Get top-k candidates
-        k = 1
-        topk_cands = np.argsort(sims, axis=1)[:, -k:][:, ::-1]
-        
+        # Get PFAS predictions
+        pfas_preds = _predict_pfas_gpu(temp_in_path, progress)
+
         # Load query data for processing
+        progress(0.5, desc="Loading spectra data...")
         msdata = MSData.load(temp_in_path, in_mem=True)
         print(f'Available columns: {msdata.columns()}')
-        
+
         # Construct results DataFrame
-        progress(0.5, desc="Constructing results table...")
+        progress(0.6, desc="Constructing results table...")
         df = []
-        cos_sim = su.PeakListModifiedCosine()
-        total_spectra = len(topk_cands)
-        
-        for i, topk in enumerate(topk_cands):
-            progress(0.5 + 0.4 * (i / total_spectra), 
-                    desc=f"Processing hits for spectrum {i+1}/{total_spectra}...")
-            
-            for n, j in enumerate(topk):
-                row_data = _create_result_row(i, j, n, msdata, msdata_lib, sims, cos_sim, embs, similarity_threshold, calculate_modified_cosine)
-                df.append(row_data)
-            
-            # Clear cache every 100 spectra to prevent memory buildup
-            if (i + 1) % 100 == 0:
-                clear_smiles_cache()
-        
+        total_spectra = len(pfas_preds)
+
+        for i in range(total_spectra):
+            progress(0.6 + 0.3 * (i / total_spectra),
+                    desc=f"Processing spectrum {i+1}/{total_spectra}...")
+
+            row_data = _create_result_row(i, msdata, pfas_preds)
+            df.append(row_data)
+
         df = pd.DataFrame(df)
-        
+
         # Process and clean results
         progress(0.9, desc="Post-processing results...")
-        df, csv_path = _process_results_dataframe(df, in_pth, similarity_threshold, calculate_modified_cosine)
-        
-        progress(1.0, desc=f"Predictions complete! Found {len(df)} high-confidence matches.")
-        
+        df, csv_path = _process_results_dataframe(df, in_pth)
+
+        progress(1.0, desc=f"PFAS screening complete! Analyzed {len(df)} spectra.")
+
         return df, csv_path
-    
+
     finally:
         # Clean up temporary files
-        if temp_lib_path.exists():
-            temp_lib_path.unlink()
         if temp_in_path.exists():
             temp_in_path.unlink()
 
 
-def predict(lib_pth, in_pth, similarity_threshold=0.75, calculate_modified_cosine=False, progress=gr.Progress(track_tqdm=True)):
+def predict(lib_pth, in_pth, progress=gr.Progress(track_tqdm=True)):
     """
-    Main prediction function with error handling
-    
+    Main PFAS screening function with error handling
+
     Args:
-        lib_pth: Library file path
+        lib_pth: Library file path (not used, kept for compatibility)
         in_pth: Input file path
-        calculate_modified_cosine: Whether to calculate modified cosine similarity
         progress: Gradio progress tracker
-    
+
     Returns:
         tuple: (results_dataframe, csv_file_path)
-    
+
     Raises:
         gr.Error: If prediction fails or input is invalid
     """
@@ -534,15 +618,11 @@ def predict(lib_pth, in_pth, similarity_threshold=0.75, calculate_modified_cosin
         # Validate input file
         if not _validate_input_file(in_pth):
             raise gr.Error("Invalid input file. Please provide a valid .mgf or .mzML file.")
-        
-        # Check if library exists
-        if not Path(lib_pth).exists():
-            raise gr.Error("Spectral library not found. Please ensure the library file exists.")
-        
-        df, csv_path = _predict_core(lib_pth, in_pth, similarity_threshold, calculate_modified_cosine, progress)
-        
+
+        df, csv_path = _predict_core(lib_pth, in_pth, None, None, progress)
+
         return df, csv_path
-        
+
     except gr.Error:
         # Re-raise Gradio errors as-is
         raise
@@ -554,8 +634,8 @@ def predict(lib_pth, in_pth, similarity_threshold=0.75, calculate_modified_cosin
             error_msg = f"Runtime error: {error_msg}. This may be due to memory or device issues."
         else:
             error_msg = f"Error: {error_msg}"
-        
-        print(f"Prediction failed: {error_msg}")
+
+        print(f"PFAS screening failed: {error_msg}")
         raise gr.Error(error_msg)
 
 
@@ -593,10 +673,8 @@ def _create_gradio_interface():
                 label="DreaMS")
         
         gr.Markdown(value="""
-            DreaMS (Deep Representations Empowering the Annotation of Mass Spectra) is a transformer-based
-             neural network designed to interpret tandem mass spectrometry (MS/MS) data (<a href="https://www.nature.com/articles/s41587-025-02663-3">Bushuiev et al., Nature Biotechnology, 2025</a>).
-             This website provides an easy access to perform library matching with DreaMS against the <a href="https://huggingface.co/datasets/roman-bushuiev/MassSpecGym">MassSpecGym</a> spectral library (combination of GNPS, MoNA, and Pluskal lab data). Please upload
-             your file with MS/MS data and click on the "Run DreaMS" button.
+            **DreaMS-PFAS Screening Tool** - This tool uses a DreaMS-based model to predict the probability of MS/MS spectra being PFAS (Per- and Polyfluoroalkyl Substances).
+            Upload your MS/MS file (.mgf or .mzML) to screen for potential PFAS compounds. The tool provides PFAS probability predictions and checks for characteristic PFAS mass defect patterns (first decimal of m/z = 0.6, 0.7, 0.8, or 0.9).
         """)
         
         # Input section
@@ -608,39 +686,22 @@ def _create_gradio_interface():
         
         # Example files
         examples = gr.Examples(
-            examples=["./data/example_5_spectra.mgf", "./data/202312_147_P55-Leaf-r2_1uL.mzML"],
+            examples=["./data/example_5_spectra.mgf"],
             inputs=[in_pth],
             label="Examples (click on a file to load as input)",
         )
 
-        # Settings section
-        with gr.Accordion("⚙️ Settings", open=False):
-            similarity_threshold = gr.Slider(
-                minimum=-1.0,
-                maximum=1.0,
-                value=0.75,
-                step=0.01,
-                label="Similarity threshold",
-                info="Only display library matches with DreaMS similarity above this threshold (rendering less results also makes calculation faster)"
-            )
-            calculate_modified_cosine = gr.Checkbox(
-                label="Calculate modified cosine similarity",
-                value=False,
-                info="Enable to also calculate traditional modified cosine similarity scores between the input spectra and library hits (a bit slower)"
-            )
-        
         # Prediction button
-        predict_button = gr.Button(value="Run DreaMS", variant="primary")
+        predict_button = gr.Button(value="Run PFAS Screening", variant="primary")
         
         # Results table
         gr.Markdown("## Predictions")
         df_file = gr.File(label="Download predictions as .csv", interactive=False, visible=True)
         
         # Results table
-        headers = ["Row", "Scan number", "Retention time", "Charge", "Precursor m/z", "Molecule", "Spectrum", 
-                   "DreaMS similarity", "Library ID"]
-        datatype = ["number", "number", "number", "str", "number", "html", "html", "number", "str"]
-        column_widths = ["20px", "30px", "30px", "25px", "30px", "40px", "40px", "40px", "50px"]
+        headers = ["Row", "Scan number", "Retention time", "Charge", "Precursor m/z", "PFAS Prediction", "Mass Defect"]
+        datatype = ["number", "number", "number", "str", "number", "html", "html"]
+        column_widths = ["50px", "80px", "100px", "60px", "100px", "120px", "100px"]
 
         df = gr.Dataframe(
             headers=headers,
@@ -648,35 +709,15 @@ def _create_gradio_interface():
             col_count=(len(headers), "fixed"),
             column_widths=column_widths,
             max_height=1000,
-            show_fullscreen_button=True,
-            show_row_numbers=False,
-            show_search='filter',
+            interactive=False,
         )
-        
+
         # Connect prediction logic
-        inputs = [in_pth, similarity_threshold, calculate_modified_cosine]
+        inputs = [in_pth]
         outputs = [df, df_file]
-        
-        # Function to update dataframe headers based on setting
-        def update_headers(show_cosine):
-            if show_cosine:
-                return gr.update(headers=headers + ["Modified cosine similarity"],
-                                col_count=(len(headers) + 1, "fixed"),
-                                column_widths=column_widths + ["40px"])
-            else:
-                return gr.update(headers=headers,
-                                col_count=(len(headers), "fixed"),
-                                column_widths=column_widths)
-        
-        # Update headers when setting changes
-        calculate_modified_cosine.change(
-            fn=update_headers,
-            inputs=[calculate_modified_cosine],
-            outputs=[df]
-        )
-        
+
         predict_func = partial(predict, LIBRARY_PATH)
-        predict_button.click(predict_func, inputs=inputs, outputs=outputs, show_progress="first")
+        predict_button.click(predict_func, inputs=inputs, outputs=outputs, show_progress="full")
     
     return app
 
