@@ -70,16 +70,17 @@ N_HIGHEST_PEAKS = 60
 
 # Load model with weights_only=False for PyTorch 2.6+ compatibility
 # Safe because this is a trusted checkpoint
+# Use map_location='cpu' to handle models saved on CUDA devices
 try:
     # Try with safe_globals context manager (PyTorch 2.6+)
     with torch.serialization.safe_globals([getattr]):
-        MODEL = HalogenDetectorDreamsTest.load_from_checkpoint(PFAS_MODEL_PATH)
+        MODEL = HalogenDetectorDreamsTest.load_from_checkpoint(PFAS_MODEL_PATH, map_location='cpu')
 except Exception as e:
     # Fallback: patch torch.load temporarily
     import functools
     original_load = torch.load
     torch.load = functools.partial(original_load, weights_only=False)
-    MODEL = HalogenDetectorDreamsTest.load_from_checkpoint(PFAS_MODEL_PATH)
+    MODEL = HalogenDetectorDreamsTest.load_from_checkpoint(PFAS_MODEL_PATH, map_location='cpu')
     torch.load = original_load
 
 # Cache for SMILES images to avoid regeneration
