@@ -65,7 +65,7 @@ EXAMPLE_PATH = Path('./data')
 
 # PFAS model configuration
 PFAS_MODEL_PATH = Path('/Users/ramsindhu/Downloads/HalogenDetection-FocalLoss-MergedMassSpecNIST20_NISTNew_NormalPFAS_ujmvyfxm_checkpoints_epoch=0-step=9285.ckpt')
-PFAS_THRESHOLD = 0.95
+PFAS_THRESHOLD = 0.90
 N_HIGHEST_PEAKS = 60
 
 # Load model with weights_only=False for PyTorch 2.6+ compatibility
@@ -681,8 +681,9 @@ def _create_gradio_interface():
     
     with app:
         # Header and description
-        gr.Image("https://raw.githubusercontent.com/pluskal-lab/DreaMS/cc806fa6fea281c1e57dd81fc512f71de9290017/assets/dreams_background.png", 
-                label="DreaMS")
+        #gr.Image("https://raw.githubusercontent.com/pluskal-lab/DreaMS/cc806fa6fea281c1e57dd81fc512f71de9290017/assets/dreams_background.png", 
+        #        label="DreaMS")
+        gr.Image("./DreaMS-PFAS.png", label="DreaMS-PFAS Screening Tool")
         
         gr.Markdown(value="""
             **DreaMS-PFAS Screening Tool** - This tool uses a DreaMS-based model to predict the probability of MS/MS spectra being PFAS (Per- and Polyfluoroalkyl Substances).
