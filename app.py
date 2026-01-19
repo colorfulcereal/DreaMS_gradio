@@ -14,6 +14,7 @@ import spaces
 import shutil
 import torch
 import urllib.request
+import time
 from datetime import datetime
 from functools import partial
 import matplotlib.pyplot as plt
@@ -250,6 +251,190 @@ def spectrum_to_html_img(spec1, spec2, img_size=SPECTRUM_IMG_SIZE):
         return f"<div style='text-align: center; color: red;'>Error: {str(e)}</div>"
 
 
+def spectrum_preview_to_html(spectrum, precursor_mz=None, width=200, height=80):
+    """
+    Create a small inline preview of a mass spectrum for table display
+
+    Args:
+        spectrum: Spectrum data (m/z and intensity arrays)
+        precursor_mz: Precursor m/z value (optional, will be marked on plot)
+        width: Width of preview image in pixels
+        height: Height of preview image in pixels
+
+    Returns:
+        str: HTML img tag with base64 encoded spectrum preview
+    """
+    try:
+        matplotlib.use('Agg')
+
+        # Create a small figure
+        fig, ax = plt.subplots(figsize=(width/100, height/100), dpi=100)
+
+        # Get spectrum data
+        mz_array = spectrum[0]
+        intensity_array = spectrum[1]
+
+        # Normalize intensity
+        max_intensity = np.max(intensity_array)
+        if max_intensity > 0:
+            intensity_array = (intensity_array / max_intensity) * 100
+
+        # Create stem plot with minimal styling
+        markerline, stemlines, baseline = ax.stem(mz_array, intensity_array,
+                                                    linefmt='steelblue',
+                                                    markerfmt=' ',
+                                                    basefmt=' ')
+        stemlines.set_linewidth(0.8)
+
+        # Mark precursor if provided
+        if precursor_mz is not None:
+            ax.axvline(x=precursor_mz, color='red', linestyle='--',
+                      linewidth=1, alpha=0.6)
+
+        # Remove labels and ticks for compact display
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlim([np.min(mz_array) - 10, np.max(mz_array) + 10])
+        ax.set_ylim([0, 110])
+
+        # Remove spines
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        # Tight layout
+        plt.tight_layout(pad=0)
+
+        # Save to buffer
+        buffered = BytesIO()
+        plt.savefig(buffered, format='png', bbox_inches='tight',
+                   dpi=100, transparent=True, pad_inches=0)
+        buffered.seek(0)
+
+        # Convert to base64
+        img = Image.open(buffered)
+        img = _crop_transparent_edges(img)
+        img_str = _convert_pil_to_base64(img)
+
+        # Clean up
+        plt.close()
+
+        return f"<img src='{img_str}' style='max-width: 100%; height: auto;' title='Spectrum preview' />"
+
+    except Exception as e:
+        return f"<div style='text-align: center; color: red; font-size: 10px;'>Error</div>"
+
+
+def create_spectrum_plot(spectrum, precursor_mz=None, title="Mass Spectrum"):
+    """
+    Create an interactive mass spectrum plot
+
+    Args:
+        spectrum: Spectrum data (m/z and intensity arrays)
+        precursor_mz: Precursor m/z value (optional, will be marked on plot)
+        title: Plot title
+
+    Returns:
+        matplotlib.figure.Figure: The spectrum plot figure
+    """
+    try:
+        matplotlib.use('Agg')
+
+        # Create figure with appropriate size
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Plot spectrum as stem plot
+        mz_array = spectrum[0]
+        intensity_array = spectrum[1]
+
+        # Normalize intensity to 100
+        max_intensity = np.max(intensity_array)
+        if max_intensity > 0:
+            intensity_array = (intensity_array / max_intensity) * 100
+
+        # Create stem plot
+        markerline, stemlines, baseline = ax.stem(mz_array, intensity_array,
+                                                    linefmt='blue',
+                                                    markerfmt=' ',
+                                                    basefmt=' ')
+        stemlines.set_linewidth(1.5)
+
+        # Mark precursor if provided
+        if precursor_mz is not None:
+            ax.axvline(x=precursor_mz, color='red', linestyle='--',
+                      linewidth=2, label=f'Precursor m/z: {precursor_mz:.4f}', alpha=0.7)
+            ax.legend()
+
+        # Labels and formatting
+        ax.set_xlabel('m/z', fontsize=12)
+        ax.set_ylabel('Relative Intensity (%)', fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_ylim([0, 110])
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        return fig
+
+    except Exception as e:
+        # Create error figure
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.text(0.5, 0.5, f'Error creating plot: {str(e)}',
+                ha='center', va='center', fontsize=12, color='red')
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+        return fig
+
+
+def extract_metadata(msdata, scan_idx=0):
+    """
+    Extract metadata from MS data
+
+    Args:
+        msdata: MSData object
+        scan_idx: Index of the scan to extract metadata from
+
+    Returns:
+        dict: Dictionary containing metadata
+    """
+    metadata = {}
+
+    try:
+        # Available columns
+        available_cols = msdata.columns()
+        metadata['Available Fields'] = ', '.join(available_cols)
+
+        # Extract common fields if available
+        if SCAN_NUMBER in available_cols:
+            metadata['Scan Number'] = msdata.get_values(SCAN_NUMBER, scan_idx)
+
+        if RT in available_cols:
+            rt = msdata.get_values(RT, scan_idx)
+            metadata['Retention Time'] = f"{rt:.2f} seconds" if rt is not None else "N/A"
+
+        if CHARGE in available_cols:
+            metadata['Charge'] = msdata.get_values(CHARGE, scan_idx)
+
+        if PRECURSOR_MZ in available_cols:
+            prec_mz = msdata.get_prec_mzs(scan_idx)
+            metadata['Precursor m/z'] = f"{prec_mz:.4f}" if prec_mz is not None else "N/A"
+
+        # Spectrum info
+        if 'spectrum' in available_cols:
+            spectrum = msdata['spectrum'][scan_idx]
+            if spectrum is not None and len(spectrum) == 2:
+                metadata['Number of Peaks'] = len(spectrum[0])
+                metadata['m/z Range'] = f"{np.min(spectrum[0]):.2f} - {np.max(spectrum[0]):.2f}"
+                metadata['Max Intensity'] = f"{np.max(spectrum[1]):.2e}"
+
+        # Dataset info
+        metadata['Total Spectra in File'] = len(msdata)
+
+    except Exception as e:
+        metadata['Error'] = str(e)
+
+    return metadata
+
+
 def pfas_to_html(pfas_prob, threshold=PFAS_THRESHOLD):
     """
     Convert PFAS probability to HTML with visual styling
@@ -477,6 +662,10 @@ def _create_result_row(i, msdata, pfas_preds):
     pfas_prob = pfas_preds[i]
     precursor_mz = msdata.get_prec_mzs(i)
 
+    # Get spectrum for preview
+    spectrum = msdata['spectrum'][i]
+    spectrum_preview = spectrum_preview_to_html(spectrum, precursor_mz, width=200, height=80)
+
     # Create row data
     row_data = {
         'scan_number': msdata.get_values(SCAN_NUMBER, i) if SCAN_NUMBER in msdata.columns() else None,
@@ -484,9 +673,9 @@ def _create_result_row(i, msdata, pfas_preds):
         'charge': msdata.get_values(CHARGE, i) if CHARGE in msdata.columns() else None,
         'precursor_mz': precursor_mz,
         'precursor_mz_raw': precursor_mz,
+        'spectrum_preview': spectrum_preview,
         'PFAS_prediction': pfas_to_html(pfas_prob),
         'PFAS_probability_raw': pfas_prob,
-        'mass_defect_check': check_mass_defect(precursor_mz),
     }
 
     return row_data
@@ -525,9 +714,9 @@ def _process_results_dataframe(df, in_pth):
         "charge": "Charge",
         "precursor_mz": "Precursor m/z",
         "precursor_mz_raw": "Precursor m/z (raw)",
+        "spectrum_preview": "Spectrum",
         "PFAS_prediction": "PFAS Prediction",
         "PFAS_probability_raw": "PFAS Probability",
-        "mass_defect_check": "Mass Defect",
     }
 
     df = df.rename(columns=column_mapping)
@@ -535,7 +724,7 @@ def _process_results_dataframe(df, in_pth):
     # Save full results to CSV
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     df_path = dio.append_to_stem(in_pth, f"PFAS_screening_{timestamp}").with_suffix('.csv')
-    df_to_save = df.drop(columns=['PFAS Prediction', 'Mass Defect', 'mass_defect_first_decimal'])
+    df_to_save = df.drop(columns=['PFAS Prediction', 'Spectrum', 'mass_defect_first_decimal'])
     df_to_save.to_csv(df_path, index=False)
 
     # Filter: Show entries with PFAS probability >= 0.95
@@ -575,8 +764,13 @@ def _predict_core(lib_pth, in_pth, similarity_threshold, calculate_modified_cosi
     shutil.copy2(in_pth, temp_in_path)
 
     try:
-        # Get PFAS predictions
+        # Get PFAS predictions with timing
+        start_time = time.time()
         pfas_preds = _predict_pfas_gpu(temp_in_path, progress)
+        end_time = time.time()
+
+        total_model_time = end_time - start_time
+        num_spectra = len(pfas_preds)
 
         # Load query data for processing
         progress(0.5, desc="Loading spectra data...")
@@ -586,16 +780,26 @@ def _predict_core(lib_pth, in_pth, similarity_threshold, calculate_modified_cosi
         # Construct results DataFrame
         progress(0.6, desc="Constructing results table...")
         df = []
-        total_spectra = len(pfas_preds)
 
-        for i in range(total_spectra):
-            progress(0.6 + 0.3 * (i / total_spectra),
-                    desc=f"Processing spectrum {i+1}/{total_spectra}...")
+        for i in range(num_spectra):
+            progress(0.6 + 0.3 * (i / num_spectra),
+                    desc=f"Processing spectrum {i+1}/{num_spectra}...")
 
             row_data = _create_result_row(i, msdata, pfas_preds)
             df.append(row_data)
 
         df = pd.DataFrame(df)
+
+        # Calculate timing statistics
+        avg_time_per_spectrum = total_model_time / num_spectra
+
+        timing_stats = {
+            'total_model_time_seconds': total_model_time,
+            'total_model_time_ms': total_model_time * 1000,
+            'avg_time_per_spectrum_seconds': avg_time_per_spectrum,
+            'avg_time_per_spectrum_ms': avg_time_per_spectrum * 1000,
+            'total_spectra': num_spectra
+        }
 
         # Process and clean results
         progress(0.9, desc="Post-processing results...")
@@ -603,7 +807,7 @@ def _predict_core(lib_pth, in_pth, similarity_threshold, calculate_modified_cosi
 
         progress(1.0, desc=f"PFAS screening complete! Analyzed {len(df)} spectra.")
 
-        return df, csv_path
+        return df, csv_path, timing_stats
 
     finally:
         # Clean up temporary files
@@ -621,7 +825,7 @@ def predict(lib_pth, in_pth, progress=gr.Progress(track_tqdm=True)):
         progress: Gradio progress tracker
 
     Returns:
-        tuple: (results_dataframe, csv_file_path)
+        tuple: (results_dataframe, csv_file_path, input_file_path, timing_info_html)
 
     Raises:
         gr.Error: If prediction fails or input is invalid
@@ -631,9 +835,40 @@ def predict(lib_pth, in_pth, progress=gr.Progress(track_tqdm=True)):
         if not _validate_input_file(in_pth):
             raise gr.Error("Invalid input file. Please provide a valid .mgf or .mzML file.")
 
-        df, csv_path = _predict_core(lib_pth, in_pth, None, None, progress)
+        df, csv_path, timing_stats = _predict_core(lib_pth, in_pth, None, None, progress)
 
-        return df, csv_path
+        # Format timing statistics as HTML with better number formatting
+        total_spectra = timing_stats['total_spectra']
+        total_time_s = timing_stats['total_model_time_seconds']
+        avg_time_ms = timing_stats['avg_time_per_spectrum_ms']
+
+        # Format total time intelligently (use seconds for > 1s, else milliseconds)
+        if total_time_s >= 1.0:
+            if total_time_s >= 60:
+                minutes = int(total_time_s // 60)
+                seconds = total_time_s % 60
+                total_time_str = f"{minutes}m {seconds:.2f}s"
+            else:
+                total_time_str = f"{total_time_s:.3f} seconds"
+        else:
+            total_time_str = f"{timing_stats['total_model_time_ms']:.1f} ms"
+
+        # Format average time (use ms for < 1000ms, else seconds)
+        if avg_time_ms >= 1000:
+            avg_time_str = f"{timing_stats['avg_time_per_spectrum_seconds']:.3f} seconds"
+        else:
+            avg_time_str = f"{avg_time_ms:.2f} ms"
+
+        timing_html = f"""
+        <div style='padding: 10px; background-color: #f0f0f0; border-radius: 5px; margin: 10px 0;'>
+            <h3 style='margin-top: 0;'>Model Performance Statistics</h3>
+            <p><strong>Total Spectra Processed:</strong> {total_spectra:,}</p>
+            <p><strong>Total Model Inference Time:</strong> {total_time_str}</p>
+            <p><strong>Average Time per Spectrum:</strong> {avg_time_str}</p>
+        </div>
+        """
+
+        return df, csv_path, in_pth, timing_html
 
     except gr.Error:
         # Re-raise Gradio errors as-is
@@ -649,6 +884,67 @@ def predict(lib_pth, in_pth, progress=gr.Progress(track_tqdm=True)):
 
         print(f"PFAS screening failed: {error_msg}")
         raise gr.Error(error_msg)
+
+
+# Global variable to store the loaded MS data for visualization
+_loaded_msdata = None
+_loaded_file_path = None
+
+
+def visualize_spectrum(in_pth, scan_number):
+    """
+    Visualize a spectrum and extract its metadata
+
+    Args:
+        in_pth: Input file path
+        scan_number: Scan number to visualize
+
+    Returns:
+        tuple: (plot_figure, metadata_json)
+    """
+    global _loaded_msdata, _loaded_file_path
+
+    try:
+        # Load data if not already loaded or if file changed
+        if _loaded_msdata is None or _loaded_file_path != in_pth:
+            if in_pth is None:
+                return None, {"Error": "No file loaded. Please run PFAS screening first."}
+
+            _loaded_file_path = in_pth
+            _loaded_msdata = MSData.load(in_pth, in_mem=True)
+
+        # Find the index corresponding to the scan number
+        available_cols = _loaded_msdata.columns()
+        if SCAN_NUMBER in available_cols:
+            scan_numbers = [_loaded_msdata.get_values(SCAN_NUMBER, i) for i in range(len(_loaded_msdata))]
+            try:
+                scan_idx = scan_numbers.index(scan_number)
+            except ValueError:
+                return None, {"Error": f"Scan number {scan_number} not found in file"}
+        else:
+            # If no scan numbers, use direct indexing
+            scan_idx = int(scan_number) - 1 if scan_number > 0 else 0
+            if scan_idx >= len(_loaded_msdata):
+                return None, {"Error": f"Index {scan_idx} out of range"}
+
+        # Get spectrum and metadata
+        spectrum = _loaded_msdata['spectrum'][scan_idx]
+        precursor_mz = _loaded_msdata.get_prec_mzs(scan_idx) if PRECURSOR_MZ in available_cols else None
+
+        # Create plot
+        title = f"Mass Spectrum - Scan {scan_number}"
+        if precursor_mz:
+            title += f" (Precursor m/z: {precursor_mz:.4f})"
+
+        fig = create_spectrum_plot(spectrum, precursor_mz, title)
+
+        # Extract metadata
+        metadata = extract_metadata(_loaded_msdata, scan_idx)
+
+        return fig, metadata
+
+    except Exception as e:
+        return None, {"Error": str(e)}
 
 
 # =============================================================================
@@ -687,7 +983,7 @@ def _create_gradio_interface():
         
         gr.Markdown(value="""
             **DreaMS-PFAS Screening Tool** - This tool uses a DreaMS-based model to predict the probability of MS/MS spectra being PFAS (Per- and Polyfluoroalkyl Substances).
-            Upload your MS/MS file (.mgf or .mzML) to screen for potential PFAS compounds. The tool provides PFAS probability predictions and checks for characteristic PFAS mass defect patterns (first decimal of m/z = 0.6, 0.7, 0.8, or 0.9).
+            Upload your MS/MS file (.mgf or .mzML) to screen for potential PFAS compounds.
         """)
         
         # Input section
@@ -706,15 +1002,18 @@ def _create_gradio_interface():
 
         # Prediction button
         predict_button = gr.Button(value="Run PFAS Screening", variant="primary")
-        
+
         # Results table
         gr.Markdown("## Predictions")
         df_file = gr.File(label="Download predictions as .csv", interactive=False, visible=True)
-        
+
+        # Timing statistics display
+        timing_display = gr.HTML(label="Processing Time Statistics", visible=True)
+
         # Results table
-        headers = ["Row", "Scan number", "Retention time", "Charge", "Precursor m/z", "PFAS Prediction", "Mass Defect"]
+        headers = ["Row", "Scan number", "Retention time", "Charge", "Precursor m/z", "Spectrum", "PFAS Prediction"]
         datatype = ["number", "number", "number", "str", "number", "html", "html"]
-        column_widths = ["50px", "80px", "100px", "60px", "100px", "120px", "100px"]
+        column_widths = ["50px", "80px", "100px", "60px", "100px", "200px", "120px"]
 
         df = gr.Dataframe(
             headers=headers,
@@ -725,12 +1024,48 @@ def _create_gradio_interface():
             interactive=False,
         )
 
+        # Spectrum Visualization Section
+        gr.Markdown("## Spectrum Visualization & Metadata")
+        gr.Markdown("Enter a scan number from the results table above to visualize the spectrum and view detailed metadata.")
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                scan_input = gr.Number(
+                    label="Scan Number",
+                    value=1,
+                    precision=0,
+                    info="Enter the scan number to visualize"
+                )
+                visualize_button = gr.Button(value="Visualize Spectrum", variant="secondary")
+
+            with gr.Column(scale=2):
+                metadata_output = gr.JSON(
+                    label="Spectrum Metadata",
+                    container=True
+                )
+
+        spectrum_plot = gr.Plot(
+            label="Mass Spectrum",
+            container=True
+        )
+
+        # Hidden state to store input file path
+        file_state = gr.State()
+
         # Connect prediction logic
         inputs = [in_pth]
-        outputs = [df, df_file]
+        outputs = [df, df_file, file_state, timing_display]
 
         predict_func = partial(predict, LIBRARY_PATH)
         predict_button.click(predict_func, inputs=inputs, outputs=outputs, show_progress="full")
+
+        # Connect visualization logic
+        visualize_button.click(
+            visualize_spectrum,
+            inputs=[file_state, scan_input],
+            outputs=[spectrum_plot, metadata_output],
+            show_progress="minimal"
+        )
     
     return app
 
@@ -745,7 +1080,7 @@ if __name__ == "__main__":
     
     # Create and launch the Gradio interface
     app = _create_gradio_interface()
-    app.launch(allowed_paths=['./assets'], share=True)
+    app.launch(allowed_paths=['./assets'], share=False)
 else:
     # When imported as a module, just run setup
     setup()

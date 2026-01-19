@@ -149,3 +149,7 @@ __pycache__
 *ckpt
 *pt
 *lightning_logs*
+*.hdf5
+DreaMS/data/temp_*.hdf5
+.gradio/
+*.code-workspace
