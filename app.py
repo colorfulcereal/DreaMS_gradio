@@ -1080,7 +1080,7 @@ if __name__ == "__main__":
     
     # Create and launch the Gradio interface
     app = _create_gradio_interface()
-    app.launch(allowed_paths=['./assets'], share=False)
+    app.launch(allowed_paths=['./assets'], share=True)
 else:
     # When imported as a module, just run setup
     setup()
